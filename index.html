@@ -119,6 +119,12 @@
             <div class="panel-header">
                 <span class="text-[10px] uppercase tracking-widest text-[var(--muted)]"><i class="fa-solid fa-layer-group mr-1"></i>Профиль объёма</span>
                 <span id="clusterInfo" class="mono text-[10px] text-[var(--muted)]"></span>
+                <span class="text-[8px] text-[var(--muted)] opacity-50 ml-2">Shift+колёсико=зум | 2x клик=сброс</span>
+                <div class="flex items-center gap-0.5 ml-2">
+                    <button id="btnHistPrev" class="text-[var(--muted)] hover:text-[var(--accent)] transition text-[10px] px-1" title="Предыдущий период"><i class="fa-solid fa-chevron-left"></i></button>
+                    <span id="histLabel" class="mono text-[9px] text-[var(--accent)] font-semibold">LIVE</span>
+                    <button id="btnHistNext" class="text-[var(--muted)] hover:text-[var(--accent)] transition text-[10px] px-1" title="Следующий период"><i class="fa-solid fa-chevron-right"></i></button>
+                </div>
             </div>
             <div class="panel-body">
                 <div id="clusterWrap" class="flex-1 overflow-hidden"></div>
@@ -155,9 +161,11 @@
         // Сырые данные по тикам (целочисленный индекс = round(price / tick))
         // Сжатие применяется ТОЛЬКО при рендеринге
         rawBuckets: new Map(), // key = integer tick index
-        cumDelta: [], totalDelta: 0,
+        cumDelta: [], totalDelta: 0, totalDeltaUsdt: 0,
         periodStart: 0, maxTrade: 0, tradeCount: 0, totalVol: 0,
-        viewCenterIdx: 0,
+        viewCenterIdx: 0, manualScroll: false, manualScrollTimer: null,
+        history: [], historyIdx: -1, // -1 = live
+        clusterColWidth: 30, // ширина кластера по умолчанию
     };
 
     let ws = null;
@@ -346,8 +354,10 @@
         if (tick.side === 'buy') { c.buyVol += tick.vol; c.buyCnt++; }
         else { c.sellVol += tick.vol; c.sellCnt++; }
 
+        const usdtVol = tick.vol * tick.price;
         S.totalDelta += tick.side === 'buy' ? tick.vol : -tick.vol;
-        S.cumDelta.push({ time: tick.time, delta: S.totalDelta });
+        S.totalDeltaUsdt += tick.side === 'buy' ? usdtVol : -usdtVol;
+        S.cumDelta.push({ time: tick.time, delta: S.totalDeltaUsdt });
         if (S.cumDelta.length > 2000) S.cumDelta.shift();
 
         S.tradeCount++; S.totalVol += tick.vol;
@@ -380,52 +390,166 @@
         return maxVol > 0 ? pocIdx : null;
     }
 
+    function cloneBuckets(map) {
+        const c = new Map();
+        for (const [k, v] of map) c.set(k, { buyVol: v.buyVol, sellVol: v.sellVol, buyCnt: v.buyCnt, sellCnt: v.sellCnt });
+        return c;
+    }
+
+    function saveToHistory() {
+        if (S.rawBuckets.size === 0) return;
+        const snapshot = {
+            rawBuckets: cloneBuckets(S.rawBuckets),
+            cumDelta: S.cumDelta.map(d => ({ time: d.time, delta: d.delta })),
+            totalDelta: S.totalDelta, totalDeltaUsdt: S.totalDeltaUsdt,
+            totalVol: S.totalVol, tradeCount: S.tradeCount, maxTrade: S.maxTrade,
+            periodStart: S.periodStart, periodEnd: Date.now(),
+            symbol: S.symbol, compression: S.compression,
+        };
+        S.history.push(snapshot);
+        if (S.history.length > 10) S.history.shift();
+    }
+
     function checkPeriodReset() {
         const now = Date.now();
         if (!S.periodStart) S.periodStart = now;
         if (now - S.periodStart >= S.period * 1000) {
-            S.rawBuckets.clear(); S.totalDelta = 0; S.cumDelta = [];
+            saveToHistory();
+            S.rawBuckets.clear(); S.totalDelta = 0; S.totalDeltaUsdt = 0; S.cumDelta = [];
             S.totalVol = 0; S.tradeCount = 0; S.maxTrade = 0; S.periodStart = now;
             S.viewCenterIdx = 0;
+            S.historyIdx = -1;
         }
+    }
+
+    function getActiveSnapshot() {
+        if (S.historyIdx >= 0 && S.historyIdx < S.history.length) return S.history[S.historyIdx];
+        return null;
+    }
+
+    function navHistory(dir) {
+        const len = S.history.length;
+        if (len === 0) return;
+        if (dir === -1) {
+            if (S.historyIdx === -1) S.historyIdx = len - 1;
+            else if (S.historyIdx > 0) S.historyIdx--;
+        } else {
+            if (S.historyIdx >= len - 1) S.historyIdx = -1;
+            else S.historyIdx++;
+        }
+        S.viewCenterIdx = 0;
+        S.manualScroll = true;
+        if (S.manualScrollTimer) clearTimeout(S.manualScrollTimer);
+        S.manualScrollTimer = setTimeout(() => { S.manualScroll = false; }, 3000);
+    }
+
+    // Компактный формат объёма USDT: $1.2K, $3.5M, $12.8B
+    function formatVol(v) {
+        if (v >= 1e9) return '$' + (v / 1e9).toFixed(1) + 'B';
+        if (v >= 1e6) return '$' + (v / 1e6).toFixed(1) + 'M';
+        if (v >= 1e3) return '$' + (v / 1e3).toFixed(1) + 'K';
+        if (v >= 100) return '$' + v.toFixed(0);
+        if (v >= 10) return '$' + v.toFixed(1);
+        return '$' + v.toFixed(2);
+    }
+
+    // Сжать произвольные сырые бакеты с заданным сжатием
+    function compressBuckets(rawBuckets, comp) {
+        const grouped = new Map();
+        for (const [tickIdx, data] of rawBuckets) {
+            const clusterIdx = Math.round(tickIdx / comp);
+            if (!grouped.has(clusterIdx)) grouped.set(clusterIdx, { buyVol: 0, sellVol: 0, buyCnt: 0, sellCnt: 0 });
+            const g = grouped.get(clusterIdx);
+            g.buyVol += data.buyVol; g.sellVol += data.sellVol;
+            g.buyCnt += data.buyCnt; g.sellCnt += data.sellCnt;
+        }
+        return grouped;
+    }
+
+    function periodLabel(snap) {
+        if (!snap) return 'LIVE';
+        return new Date(snap.periodStart).toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'});
     }
 
     // === РЕНДЕРИНГ ===
     function renderClusters() {
         const inst = getInst(S.symbol);
-        const step = inst.tick * S.compression;
-        if (S.rawBuckets.size === 0 || S.price === 0) {
+        const comp = S.compression;
+        const step = inst.tick * comp;
+
+        // Собираем все периоды: история + текущий
+        const allPeriods = [];
+        for (let i = 0; i < S.history.length; i++) {
+            const h = S.history[i];
+            allPeriods.push({
+                buckets: compressBuckets(h.rawBuckets, comp),
+                snap: h, isLive: false,
+                label: periodLabel(h)
+            });
+        }
+        allPeriods.push({
+            buckets: compressBuckets(S.rawBuckets, comp),
+            snap: null, isLive: true,
+            label: 'LIVE'
+        });
+
+        const hasData = allPeriods.some(p => p.buckets.size > 0);
+        if (!hasData || S.price === 0) {
             elCluster.innerHTML = '<div class="flex items-center justify-center h-full text-[var(--muted)] text-xs">Ожидание данных Binance...</div>';
             return;
         }
 
-        // Сжимаем только при рендеринге
-        const buckets = getCompressedBuckets();
-        const pocIdx = calcPOC(buckets);
+        // Сколько столбцов-периодов помещается
+        const containerW = elCluster.clientWidth;
+        const containerH = elCluster.clientHeight;
+        const fixedW = 195; // vol(65) + delta(55) + price(75)
+        const minBarW = 20;
+        const maxBarW = 400;
+        const maxCols = allPeriods.length;
+
+        let barColW;
+        if (S.clusterColWidth > 0) {
+            barColW = Math.max(minBarW, Math.min(maxBarW, S.clusterColWidth));
+        } else {
+            barColW = 30; // по умолчанию 30px
+        }
+        const fitCols = Math.max(1, Math.floor((containerW - fixedW) / barColW));
+        const numCols = Math.min(maxCols, fitCols);
+        // Показываем последние numCols периодов (live всегда справа)
+        const vis = allPeriods.slice(-numCols);
+
+        // POC из текущего (live) периода
+        const liveP = vis.find(p => p.isLive) || vis[vis.length - 1];
+        const pocIdx = calcPOC(liveP.buckets);
         const currentIdx = Math.round(S.price / step);
 
         if (S.viewCenterIdx === 0) S.viewCenterIdx = currentIdx;
 
-        const containerH = elCluster.clientHeight;
-        const rowH = 20;
-        const visibleCount = Math.floor(containerH / rowH);
+        const rowH = 16;
+        const headerH = 16;
+        const usableH = containerH - headerH;
+        const visibleCount = Math.floor(usableH / rowH);
         const halfCount = Math.floor(visibleCount / 2);
 
-        // Автоскролл
-        const viewTopIdx = S.viewCenterIdx + halfCount;
-        const viewBottomIdx = S.viewCenterIdx - halfCount;
-        const margin = Math.floor(visibleCount * 0.25);
-        if (currentIdx > viewTopIdx - margin) S.viewCenterIdx += (currentIdx - (viewTopIdx - margin));
-        else if (currentIdx < viewBottomIdx + margin) S.viewCenterIdx -= ((viewBottomIdx + margin) - currentIdx);
+        // Автоскролл (отключён при ручной прокрутке)
+        if (!S.manualScroll) {
+            const viewTopIdx = S.viewCenterIdx + halfCount;
+            const viewBottomIdx = S.viewCenterIdx - halfCount;
+            const margin = Math.floor(visibleCount * 0.25);
+            if (currentIdx > viewTopIdx - margin) S.viewCenterIdx += (currentIdx - (viewTopIdx - margin));
+            else if (currentIdx < viewBottomIdx + margin) S.viewCenterIdx -= ((viewBottomIdx + margin) - currentIdx);
+        }
 
         const topIdx = S.viewCenterIdx + halfCount;
         const botIdx = S.viewCenterIdx - halfCount;
 
-        // Макс объём
-        let maxVol = 0.01;
-        for (let idx = botIdx; idx <= topIdx; idx++) {
-            const c = buckets.get(idx);
-            if (c) maxVol = Math.max(maxVol, c.buyVol + c.sellVol);
+        // MaxVol для каждого периода (в видимом диапазоне)
+        for (const p of vis) {
+            p.maxVol = 0.01;
+            for (let idx = botIdx; idx <= topIdx; idx++) {
+                const c = p.buckets.get(idx);
+                if (c) p.maxVol = Math.max(p.maxVol, c.buyVol + c.sellVol);
+            }
         }
 
         // Позиция цены
@@ -435,22 +559,42 @@
         const priceRowFrac = halfCount - priceFromCenter;
 
         let html = '';
-        html += `<div style="position:absolute;top:${priceRowFrac * rowH}px;left:0;right:0;height:1px;background:var(--accent);opacity:0.7;z-index:5;pointer-events:none;"></div>`;
+        // Линия текущей цены
+        html += `<div style="position:absolute;top:${headerH + priceRowFrac * rowH}px;left:0;right:0;height:1px;background:var(--accent);opacity:0.7;z-index:5;pointer-events:none;"></div>`;
 
-        html += '<table class="w-full" style="border-collapse:collapse;position:relative;z-index:1;">';
-        html += '<colgroup><col style="width:calc(100% - 120px)"><col style="width:45px"><col style="width:75px"></colgroup>';
+        // Таблица прижата вправо — цифры всегда у правого края
+        const totalBarW = numCols * barColW;
+        html += `<table style="border-collapse:collapse;position:absolute;right:0;top:0;bottom:0;z-index:1;">`;
 
+        // Colgroup: N бар-столбцов + vol + delta + price
+        html += '<colgroup>';
+        for (let i = 0; i < numCols; i++) html += `<col style="width:${barColW}px">`;
+        html += '<col style="width:65px"><col style="width:55px"><col style="width:75px"></colgroup>';
+
+        // Строка заголовков периодов
+        html += `<tr style="height:${headerH}px;">`;
+        for (const p of vis) {
+            const color = p.isLive ? 'var(--buy)' : 'var(--muted)';
+            const fw = p.isLive ? '700' : '400';
+            html += `<td class="mono text-center text-[8px]" style="color:${color};font-weight:${fw};border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden;">${p.label}</td>`;
+        }
+        html += '<td style="border-bottom:1px solid var(--border);"></td>';
+        html += '<td style="border-bottom:1px solid var(--border);"></td>';
+        html += '<td style="border-bottom:1px solid var(--border);"></td>';
+        html += '</tr>';
+
+        // Строки ценовых уровней
         for (let idx = topIdx; idx >= botIdx; idx--) {
-            const c = buckets.get(idx) || { buyVol: 0, sellVol: 0 };
-            const total = c.buyVol + c.sellVol;
-            const delta = c.buyVol - c.sellVol;
+            // Данные live-периода для vol/delta/price
+            const liveC = liveP.buckets.get(idx) || { buyVol: 0, sellVol: 0 };
+            const total = liveC.buyVol + liveC.sellVol;
+            const delta = liveC.buyVol - liveC.sellVol;
             const price = idx * step;
+            const totalUsdt = total * price;
+            const deltaUsdt = delta * price;
             const isPoc = pocIdx !== null && idx === pocIdx;
             const isCurrent = idx === currentIdx;
 
-            const totalW = maxVol > 0 ? (total / maxVol) * 100 : 0;
-            const buyW = total > 0 ? (c.buyVol / total) * totalW : 0;
-            const sellW = total > 0 ? (c.sellVol / total) * totalW : 0;
             const deltaClass = delta >= 0 ? 'delta-pos' : 'delta-neg';
             const deltaSign = delta >= 0 ? '+' : '';
 
@@ -459,27 +603,58 @@
             else if (isCurrent) { priceColor = 'var(--accent)'; priceWeight = '700'; }
 
             html += `<tr class="c-row${isPoc ? ' is-poc' : ''}" style="height:${rowH}px;">`;
-            html += `<td class="px-1"><div style="display:flex;height:14px;border-radius:2px;overflow:hidden;background:rgba(255,255,255,.02);">`;
-            if (total > 0) {
-                html += `<div class="bar-buy" style="width:${buyW.toFixed(2)}%;"></div>`;
-                html += `<div class="bar-sell" style="width:${sellW.toFixed(2)}%;"></div>`;
+
+            // Бар для каждого периода
+            for (const p of vis) {
+                const c = p.buckets.get(idx) || { buyVol: 0, sellVol: 0 };
+                const t = c.buyVol + c.sellVol;
+                const tw = p.maxVol > 0 ? (t / p.maxVol) * 100 : 0;
+                const bw = t > 0 ? (c.buyVol / t) * tw : 0;
+                const sw = t > 0 ? (c.sellVol / t) * tw : 0;
+                const opacity = p.isLive ? 1 : 0.55;
+
+                html += `<td class="px-0.5"><div style="display:flex;height:11px;border-radius:1px;overflow:hidden;background:rgba(255,255,255,.02);opacity:${opacity};">`;
+                if (t > 0) {
+                    html += `<div class="bar-buy" style="width:${bw.toFixed(2)}%;"></div>`;
+                    html += `<div class="bar-sell" style="width:${sw.toFixed(2)}%;"></div>`;
+                }
+                html += '</div></td>';
             }
-            html += `</div></td>`;
-            html += `<td class="mono text-right text-[10px] ${deltaClass} pr-2" style="white-space:nowrap;">`;
-            if (Math.abs(delta) > 0.0005) html += `${deltaSign}${delta.toFixed(inst.volDec)}`;
-            html += `</td>`;
-            html += `<td class="mono text-right pr-2 text-[11px]" style="color:${priceColor};font-weight:${priceWeight};white-space:nowrap;">`;
+
+            // Vol, Delta, Price — из live-периода
+            html += `<td class="mono text-center text-[10px] px-1" style="white-space:nowrap;color:${priceColor};font-weight:${priceWeight};vertical-align:middle;">`;
+            if (totalUsdt > 0.5) html += formatVol(totalUsdt);
+            html += '</td>';
+            html += `<td class="mono text-right text-[9px] ${deltaClass} pr-1" style="white-space:nowrap;">`;
+            if (Math.abs(deltaUsdt) > 0.5) html += `${deltaSign}${formatVol(Math.abs(deltaUsdt))}`;
+            html += '</td>';
+            html += `<td class="mono text-right pr-1 text-[10px]" style="color:${priceColor};font-weight:${priceWeight};white-space:nowrap;">`;
             if (isPoc) html += '<i class="fa-solid fa-caret-left text-[7px] mr-0.5" style="color:var(--poc)"></i>';
             html += `${price.toFixed(inst.decimals)}`;
-            html += `</td></tr>`;
+            html += '</td></tr>';
         }
 
         html += '</table>';
         elCluster.innerHTML = html;
         elCluster.style.position = 'relative';
 
+        // Вертикальные разделители между кластерами (считаем от правого края)
+        const tableW = totalBarW + fixedW;
+        const leftOffset = Math.max(0, containerW - tableW); // пустое место слева
+        let divHtml = '';
+        for (let i = 1; i < numCols; i++) {
+            const x = leftOffset + i * barColW;
+            divHtml += `<div style="position:absolute;top:${headerH}px;bottom:0;left:${x}px;width:1px;background:var(--border);opacity:0.4;z-index:2;pointer-events:none;"></div>`;
+        }
+        elCluster.insertAdjacentHTML('beforeend', divHtml);
+
+        // Обновляем метку истории
+        const histLabel = $('histLabel');
+        histLabel.textContent = `${vis.length} периодов`;
+        histLabel.style.color = 'var(--buy)';
+
         $('hdrPoc').textContent = pocIdx !== null ? (pocIdx * step).toFixed(inst.decimals) : '—';
-        $('clusterInfo').textContent = `Уровней: ${buckets.size} | Шаг: ${step.toFixed(inst.decimals)} | Сделок: ${S.tradeCount}`;
+        $('clusterInfo').textContent = `Периодов: ${vis.length} | Шаг: ${step.toFixed(inst.decimals)} | Сделок: ${S.tradeCount} | Ширина: ${barColW}px`;
     }
 
     function renderDelta() {
@@ -574,8 +749,9 @@
 
     function start() {
         S.price = 0; S.priceStart = 0; S.openPrice = 0; S.viewCenterIdx = 0;
-        S.rawBuckets.clear(); S.cumDelta = []; S.totalDelta = 0;
+        S.rawBuckets.clear(); S.cumDelta = []; S.totalDelta = 0; S.totalDeltaUsdt = 0;
         S.totalVol = 0; S.tradeCount = 0; S.maxTrade = 0; S.periodStart = Date.now();
+        S.historyIdx = -1; S.clusterColWidth = 30;
         $('inpSymbol').classList.remove('error');
         connectWS();
         if (!renderRAF) renderRAF = requestAnimationFrame(renderLoop);
@@ -609,8 +785,9 @@
         S.period = parseInt(e.target.value);
         S.periodStart = Date.now();
         S.viewCenterIdx = 0;
-        S.rawBuckets.clear(); S.totalDelta = 0; S.cumDelta = [];
+        S.rawBuckets.clear(); S.totalDelta = 0; S.totalDeltaUsdt = 0; S.cumDelta = [];
         S.totalVol = 0; S.tradeCount = 0; S.maxTrade = 0;
+        S.historyIdx = -1;
     });
     $('selCompress').addEventListener('change', e => {
         S.compression = parseInt(e.target.value);
@@ -621,6 +798,44 @@
         S.soundOn = !S.soundOn;
         $('btnSound').innerHTML = S.soundOn ? '<i class="fa-solid fa-volume-high" style="color:var(--accent)"></i>' : '<i class="fa-solid fa-volume-xmark"></i>';
         if (S.soundOn && !audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    });
+
+    // === НАВИГАЦИЯ ПО ИСТОРИИ ===
+    $('btnHistPrev').addEventListener('click', () => navHistory(-1));
+    $('btnHistNext').addEventListener('click', () => navHistory(1));
+    document.addEventListener('keydown', e => {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+        if (e.key === 'ArrowLeft') { e.preventDefault(); navHistory(-1); }
+        else if (e.key === 'ArrowRight') { e.preventDefault(); navHistory(1); }
+    });
+
+    // === ПРОКРУТКА КОЛЁСИКОМ ===
+    elCluster.addEventListener('wheel', e => {
+        e.preventDefault();
+        const inst = getInst(S.symbol);
+
+        // Shift + колёсико = масштаб кластеров (шире/уже)
+        if (e.shiftKey) {
+            const zoomStep = 5;
+            const delta = e.deltaY > 0 ? -zoomStep : zoomStep; // вниз = уже, вверх = шире
+            const minW = 15, maxW = 400;
+            S.clusterColWidth = Math.max(minW, Math.min(maxW, S.clusterColWidth + delta));
+            return;
+        }
+
+        // Обычная прокрутка профиля
+        const step = inst.tick * S.compression;
+        const scrollRows = Math.max(1, Math.round(Math.abs(e.deltaY) / 40));
+        const dir = e.deltaY > 0 ? -1 : 1; // вниз по списку = ниже цена
+        S.viewCenterIdx += dir * scrollRows;
+        S.manualScroll = true;
+        if (S.manualScrollTimer) clearTimeout(S.manualScrollTimer);
+        S.manualScrollTimer = setTimeout(() => { S.manualScroll = false; }, 3000);
+    }, { passive: false });
+
+    // Двойной клик = сброс ширины кластера на 30px
+    elCluster.addEventListener('dblclick', () => {
+        S.clusterColWidth = 30;
     });
 
     loadExchangeInfo().then(() => start());
