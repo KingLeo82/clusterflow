@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ClusterFlow — Терминал</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        :root {
+            --bg: #060a12; --bg2: #0c1220; --bg3: #141c2e; --border: #1e2a42;
+            --text: #dce4f0; --muted: #5a6a84;
+            --buy: #00e87b; --buy-dim: rgba(0,232,123,0.15);
+            --sell: #ff2e5e; --sell-dim: rgba(255,46,94,0.15);
+            --accent: #ff9500; --poc: #ffd500;
+        }
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { font-family:'Space Grotesk',sans-serif; background:var(--bg); color:var(--text); height:100vh; overflow:hidden; }
+        .mono { font-family:'JetBrains Mono',monospace; }
+        ::-webkit-scrollbar { width:4px; }
+        ::-webkit-scrollbar-track { background:var(--bg2); }
+        ::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+
+        @keyframes pulse-dot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(1.4)} }
+
+        .live-dot { width:7px;height:7px;border-radius:50%;background:var(--buy);animation:pulse-dot 1.8s infinite; }
+        .live-dot.offline { background:var(--sell); animation:none; }
+        
+        .sel { background:var(--bg3);border:1px solid var(--border);color:var(--text); padding:4px 8px;border-radius:5px;font-size:11px;outline:none;cursor:pointer; font-family:'JetBrains Mono',monospace; }
+        .sel:focus { border-color:var(--accent); }
+
+        .inp-symbol { background:var(--bg3);border:1px solid var(--border);color:var(--text); padding:4px 8px;border-radius:5px;font-size:12px;outline:none; font-family:'JetBrains Mono',monospace; width:80px; text-transform:uppercase; font-weight:600; }
+        .inp-symbol:focus { border-color:var(--accent); }
+        .inp-symbol.error { border-color:var(--sell); }
+
+        .c-row { border-bottom:1px solid rgba(30,42,66,.3); }
+        .c-row:hover { background:rgba(255,255,255,.02); }
+        .c-row.is-poc { background:rgba(255,213,0,.06); }
+
+        .bar-buy { background: linear-gradient(90deg, rgba(0,232,123,0.25), rgba(0,232,123,0.5)); height:100%; transition:width .15s; }
+        .bar-sell { background: linear-gradient(90deg, rgba(255,46,94,0.5), rgba(255,46,94,0.25)); height:100%; transition:width .15s; }
+        .delta-pos { color:var(--buy); } .delta-neg { color:var(--sell); }
+        #deltaCanvas { width:100%; height:100%; display:block; }
+
+        #workspace { display:flex; flex-direction:row; width:100%; height:calc(100vh - 48px); }
+        
+        .panel { display:flex; flex-direction:column; background:var(--bg2); border:1px solid var(--border); overflow:hidden; }
+        .panel-header { padding:6px 12px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; background:rgba(6,10,18,0.5); flex-shrink:0; }
+        .panel-body { flex:1; overflow:hidden; position:relative; display:flex; flex-direction:column; }
+        
+        .divider-h { width:6px; background:var(--bg); cursor:col-resize; position:relative; z-index:10; flex-shrink:0; transition:background .2s; }
+        .divider-h:hover, .divider-h.active { background:var(--accent); }
+
+        .divider-h::after { content:''; position:absolute; background:var(--muted); border-radius:1px; opacity:0.4; width:2px; height:24px; top:50%; left:50%; transform:translate(-50%, -50%); }
+
+        .ws-status { font-size:9px; padding:2px 6px; border-radius:3px; font-weight:600; letter-spacing:0.5px; }
+        .ws-status.connected { background:rgba(0,232,123,.12); color:var(--buy); }
+        .ws-status.disconnected { background:rgba(255,46,94,.12); color:var(--sell); }
+        .ws-status.connecting { background:rgba(255,149,0,.12); color:var(--accent); }
+        .ws-status.invalid { background:rgba(255,46,94,.12); color:var(--sell); }
+    </style>
+</head>
+<body>
+
+    <!-- HEADER -->
+    <header style="background:var(--bg2);border-bottom:1px solid var(--border);height:48px; position:relative; z-index:100;" class="flex items-center px-3 gap-3">
+        <div class="flex items-center gap-1.5">
+            <i class="fa-solid fa-chart-column text-[var(--accent)]"></i>
+            <span class="font-bold text-sm tracking-tight">ClusterFlow</span>
+        </div>
+        <div class="w-px h-6 bg-[var(--border)]"></div>
+        <div class="flex items-center gap-1">
+            <input id="inpSymbol" class="inp-symbol" value="BTC" placeholder="BTC" spellcheck="false" autocomplete="off" title="Введите тикер без USDT">
+            <span class="mono text-[11px] text-[var(--muted)] font-semibold">/USDT</span>
+        </div>
+        <div class="flex items-center gap-2">
+            <span id="hdrPrice" class="mono font-semibold text-base">—</span>
+            <span id="hdrChg" class="mono text-[10px] px-1.5 py-0.5 rounded">0%</span>
+            <div id="liveDot" class="live-dot offline"></div>
+        </div>
+        <div class="w-px h-6 bg-[var(--border)]"></div>
+        <span id="wsStatus" class="ws-status disconnected">OFFLINE</span>
+        <div class="w-px h-6 bg-[var(--border)]"></div>
+        <select id="selPeriod" class="sel" title="Период кластера">
+            <option value="60">1м</option>
+            <option value="300" selected>5м</option>
+            <option value="900">15м</option>
+            <option value="3600">1ч</option>
+        </select>
+        <div class="w-px h-6 bg-[var(--border)]"></div>
+        <div class="flex items-center gap-1.5 text-[10px] text-[var(--muted)]">
+            <span>Сжатие:</span>
+            <select id="selCompress" class="sel">
+                <option value="1">1x</option>
+                <option value="2">2x</option>
+                <option value="5" selected>5x</option>
+                <option value="10">10x</option>
+                <option value="20">20x</option>
+                <option value="50">50x</option>
+            </select>
+        </div>
+        <button id="btnSound" class="text-[var(--muted)] hover:text-[var(--accent)] transition text-xs ml-1" title="Звук">
+            <i class="fa-solid fa-volume-xmark"></i>
+        </button>
+        <div class="flex-1"></div>
+        <div class="flex items-center gap-3 text-[10px] text-[var(--muted)] mono">
+            <span>Delta: <b id="hdrDelta" class="text-[var(--text)]">0</b></span>
+            <span>POC: <b id="hdrPoc" class="text-[var(--poc)]">—</b></span>
+            <span id="hdrTime"></span>
+        </div>
+    </header>
+
+    <!-- WORKSPACE: Профиль | Дельта -->
+    <main id="workspace">
+
+        <!-- Профиль объёма -->
+        <div class="panel" id="panelCluster" style="width: 55%; min-width: 250px;">
+            <div class="panel-header">
+                <span class="text-[10px] uppercase tracking-widest text-[var(--muted)]"><i class="fa-solid fa-layer-group mr-1"></i>Профиль объёма</span>
+                <span id="clusterInfo" class="mono text-[10px] text-[var(--muted)]"></span>
+            </div>
+            <div class="panel-body">
+                <div id="clusterWrap" class="flex-1 overflow-hidden"></div>
+            </div>
+        </div>
+
+        <div class="divider-h" id="divClusterDelta"></div>
+
+        <!-- Кум. дельта -->
+        <div class="panel" id="panelDelta" style="flex: 1; min-width: 150px;">
+            <div class="panel-header">
+                <span class="text-[10px] uppercase tracking-widest text-[var(--muted)]"><i class="fa-solid fa-wave-square mr-1"></i>Кум. дельта</span>
+                <span id="deltaInfo" class="mono text-[10px] text-[var(--muted)]"></span>
+            </div>
+            <div class="panel-body">
+                <canvas id="deltaCanvas"></canvas>
+            </div>
+        </div>
+
+    </main>
+
+    <script>
+    /* ================================================================
+       ClusterFlow — Binance Futures
+       Профиль | Дельта. Без разрывов (целочисленные индексы).
+    ================================================================ */
+
+    const INSTRUMENTS = {};
+    let allFutures = {};
+
+    const S = {
+        symbol: 'BTCUSDT', period: 300, compression: 5, soundOn: false,
+        price: 0, priceStart: 0, openPrice: 0,
+        // Сырые данные по тикам (целочисленный индекс = round(price / tick))
+        // Сжатие применяется ТОЛЬКО при рендеринге
+        rawBuckets: new Map(), // key = integer tick index
+        cumDelta: [], totalDelta: 0,
+        periodStart: 0, maxTrade: 0, tradeCount: 0, totalVol: 0,
+        viewCenterIdx: 0,
+    };
+
+    let ws = null;
+    let wsReconnectTimer = null;
+    let wsReconnectAttempts = 0;
+    const WS_MAX_RECONNECT = 50;
+    const WS_BASE_DELAY = 1000;
+
+    const $ = id => document.getElementById(id);
+    const elCluster = $('clusterWrap');
+    const canvas = $('deltaCanvas');
+    const ctx = canvas.getContext('2d');
+
+    // === ЗАГРУЗКА СПИСКА ФЬЮЧЕРСОВ ===
+    async function loadExchangeInfo() {
+        try {
+            const resp = await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
+            const data = await resp.json();
+            for (const sym of data.symbols) {
+                if (sym.contractType === 'PERPETUAL' && sym.quoteAsset === 'USDT' && sym.status === 'TRADING') {
+                    const tickSize = parseFloat(sym.filters.find(f => f.filterType === 'PRICE_FILTER').tickSize);
+                    const lotFilter = sym.filters.find(f => f.filterType === 'LOT_SIZE');
+                    const minQty = parseFloat(lotFilter ? lotFilter.minQty : 0.001);
+                    allFutures[sym.symbol] = {
+                        tickSize,
+                        pricePrecision: sym.pricePrecision,
+                        quantityPrecision: sym.quantityPrecision,
+                        minQty,
+                    };
+                }
+            }
+            console.log(`[ExchangeInfo] Loaded ${Object.keys(allFutures).length} USDT perpetual futures`);
+        } catch(e) {
+            console.warn('[ExchangeInfo] Failed to load:', e);
+        }
+    }
+
+    function getInst(symbol) {
+        if (INSTRUMENTS[symbol]) return INSTRUMENTS[symbol];
+        if (allFutures[symbol]) {
+            const info = allFutures[symbol];
+            INSTRUMENTS[symbol] = {
+                tick: info.tickSize,
+                decimals: info.pricePrecision,
+                volDec: info.quantityPrecision,
+                largeMul: Math.max(info.minQty * 2, 1 / Math.pow(10, info.quantityPrecision))
+            };
+            return INSTRUMENTS[symbol];
+        }
+        INSTRUMENTS[symbol] = { tick: 0.01, decimals: 2, volDec: 3, largeMul: 1 };
+        return INSTRUMENTS[symbol];
+    }
+
+    function autoDetectFromPrice(symbol, price) {
+        if (allFutures[symbol]) return;
+        const priceStr = price.toString();
+        const dotIdx = priceStr.indexOf('.');
+        let decimals = 0;
+        if (dotIdx >= 0) decimals = priceStr.length - dotIdx - 1;
+        decimals = Math.min(decimals, 8);
+        const tick = Math.pow(10, -decimals);
+        if (INSTRUMENTS[symbol] && INSTRUMENTS[symbol].tick <= tick) return;
+        INSTRUMENTS[symbol] = { tick, decimals, volDec: 3, largeMul: 1 };
+    }
+
+    // === РАЗДЕЛИТЕЛЬ ===
+    (function() {
+        const divider = $('divClusterDelta');
+        const panelBefore = $('panelCluster');
+        const panelAfter = $('panelDelta');
+        let startPos, startSizeBefore;
+        function onDown(e) {
+            e.preventDefault();
+            divider.classList.add('active');
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
+            startPos = e.clientX;
+            startSizeBefore = panelBefore.offsetWidth;
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        }
+        function onMove(e) {
+            const newSize = startSizeBefore + (e.clientX - startPos);
+            const parentW = panelBefore.parentElement.offsetWidth;
+            const clamped = Math.max(150, Math.min(newSize, parentW - 100));
+            panelBefore.style.width = clamped + 'px';
+            panelBefore.style.flex = 'none';
+        }
+        function onUp() {
+            divider.classList.remove('active');
+            document.body.style.cursor = 'default';
+            document.body.style.userSelect = 'auto';
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+        }
+        divider.addEventListener('mousedown', onDown);
+    })();
+
+    // === АУДИО ===
+    let audioCtx = null;
+    function playTick(freq, dur) {
+        if (!S.soundOn) return;
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.connect(g); g.connect(audioCtx.destination);
+        o.type = 'sine'; o.frequency.value = freq;
+        g.gain.value = 0.06;
+        g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+        o.start(); o.stop(audioCtx.currentTime + dur);
+    }
+
+    // === BINANCE WEBSOCKET ===
+    function connectWS() {
+        if (ws) { ws.close(); ws = null; }
+        if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+        const sym = S.symbol.toLowerCase();
+        const url = `wss://fstream.binance.com/ws/${sym}@aggTrade`;
+        setWSStatus('connecting');
+        try { ws = new WebSocket(url); } catch(e) { scheduleReconnect(); return; }
+        ws.onopen = () => { wsReconnectAttempts = 0; setWSStatus('connected'); fetchMarkPrice(); };
+        ws.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.e === 'aggTrade') handleAggTrade(msg);
+                else if (msg.code) { setWSStatus('invalid'); $('inpSymbol').classList.add('error'); if (ws) { ws.close(); ws = null; } }
+            } catch(e) {}
+        };
+        ws.onerror = () => {};
+        ws.onclose = (event) => { if (event.code === 1111) return; setWSStatus('disconnected'); scheduleReconnect(); };
+    }
+
+    function scheduleReconnect() {
+        if (wsReconnectAttempts >= WS_MAX_RECONNECT) return;
+        const delay = Math.min(WS_BASE_DELAY * Math.pow(1.5, wsReconnectAttempts), 30000);
+        wsReconnectAttempts++;
+        wsReconnectTimer = setTimeout(() => connectWS(), delay);
+    }
+
+    function setWSStatus(status) {
+        const el = $('wsStatus');
+        const dot = $('liveDot');
+        if (status === 'connected') { el.className = 'ws-status connected'; el.textContent = 'LIVE'; dot.className = 'live-dot'; }
+        else if (status === 'connecting') { el.className = 'ws-status connecting'; el.textContent = 'CONN...'; dot.className = 'live-dot offline'; }
+        else if (status === 'invalid') { el.className = 'ws-status invalid'; el.textContent = 'INVALID'; dot.className = 'live-dot offline'; }
+        else { el.className = 'ws-status disconnected'; el.textContent = 'OFFLINE'; dot.className = 'live-dot offline'; }
+    }
+
+    async function fetchMarkPrice() {
+        try {
+            const resp = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${S.symbol}`);
+            const data = await resp.json();
+            if (data.code) { setWSStatus('invalid'); $('inpSymbol').classList.add('error'); if (ws) { ws.close(1111); ws = null; } return; }
+            $('inpSymbol').classList.remove('error');
+            if (data.price) {
+                const p = parseFloat(data.price);
+                if (!S.price || S.price === 0) { S.price = p; S.priceStart = p; S.openPrice = p; }
+                else S.price = p;
+            }
+        } catch(e) {}
+        try {
+            const resp = await fetch(`https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${S.symbol}`);
+            const data = await resp.json();
+            if (data.openPrice) { S.openPrice = parseFloat(data.openPrice); S.priceStart = S.openPrice; }
+        } catch(e) {}
+    }
+
+    function handleAggTrade(msg) {
+        const price = parseFloat(msg.p);
+        const vol = parseFloat(msg.q);
+        const side = msg.m ? 'sell' : 'buy';
+        const time = msg.E || Date.now();
+        if (vol <= 0) return;
+        S.price = price;
+        autoDetectFromPrice(S.symbol, price);
+        processTick({ time, price, vol, side });
+    }
+
+    function processTick(tick) {
+        const inst = getInst(S.symbol);
+        // Храним на уровне тика (inst.tick), сжатие — при рендере
+        const tickIdx = Math.round(tick.price / inst.tick);
+
+        if (!S.rawBuckets.has(tickIdx)) S.rawBuckets.set(tickIdx, { buyVol: 0, sellVol: 0, buyCnt: 0, sellCnt: 0 });
+        const c = S.rawBuckets.get(tickIdx);
+        if (tick.side === 'buy') { c.buyVol += tick.vol; c.buyCnt++; }
+        else { c.sellVol += tick.vol; c.sellCnt++; }
+
+        S.totalDelta += tick.side === 'buy' ? tick.vol : -tick.vol;
+        S.cumDelta.push({ time: tick.time, delta: S.totalDelta });
+        if (S.cumDelta.length > 2000) S.cumDelta.shift();
+
+        S.tradeCount++; S.totalVol += tick.vol;
+        if (tick.vol > S.maxTrade) S.maxTrade = tick.vol;
+
+        if (tick.vol >= inst.largeMul) playTick(tick.side === 'buy' ? 880 : 330, 0.1);
+    }
+
+    // Сжать сырые тиковые данные в кластеры заданного шага
+    function getCompressedBuckets() {
+        const inst = getInst(S.symbol);
+        const compressRatio = S.compression; // сколько тиков в одном кластере
+        const grouped = new Map();
+        for (const [tickIdx, data] of S.rawBuckets) {
+            const clusterIdx = Math.round(tickIdx / compressRatio); // целочисленное деление!
+            if (!grouped.has(clusterIdx)) grouped.set(clusterIdx, { buyVol: 0, sellVol: 0, buyCnt: 0, sellCnt: 0 });
+            const g = grouped.get(clusterIdx);
+            g.buyVol += data.buyVol; g.sellVol += data.sellVol;
+            g.buyCnt += data.buyCnt; g.sellCnt += data.sellCnt;
+        }
+        return grouped;
+    }
+
+    function calcPOC(buckets) {
+        let maxVol = 0, pocIdx = 0;
+        for (const [idx, c] of buckets) {
+            const v = c.buyVol + c.sellVol;
+            if (v > maxVol) { maxVol = v; pocIdx = idx; }
+        }
+        return maxVol > 0 ? pocIdx : null;
+    }
+
+    function checkPeriodReset() {
+        const now = Date.now();
+        if (!S.periodStart) S.periodStart = now;
+        if (now - S.periodStart >= S.period * 1000) {
+            S.rawBuckets.clear(); S.totalDelta = 0; S.cumDelta = [];
+            S.totalVol = 0; S.tradeCount = 0; S.maxTrade = 0; S.periodStart = now;
+            S.viewCenterIdx = 0;
+        }
+    }
+
+    // === РЕНДЕРИНГ ===
+    function renderClusters() {
+        const inst = getInst(S.symbol);
+        const step = inst.tick * S.compression;
+        if (S.rawBuckets.size === 0 || S.price === 0) {
+            elCluster.innerHTML = '<div class="flex items-center justify-center h-full text-[var(--muted)] text-xs">Ожидание данных Binance...</div>';
+            return;
+        }
+
+        // Сжимаем только при рендеринге
+        const buckets = getCompressedBuckets();
+        const pocIdx = calcPOC(buckets);
+        const currentIdx = Math.round(S.price / step);
+
+        if (S.viewCenterIdx === 0) S.viewCenterIdx = currentIdx;
+
+        const containerH = elCluster.clientHeight;
+        const rowH = 20;
+        const visibleCount = Math.floor(containerH / rowH);
+        const halfCount = Math.floor(visibleCount / 2);
+
+        // Автоскролл
+        const viewTopIdx = S.viewCenterIdx + halfCount;
+        const viewBottomIdx = S.viewCenterIdx - halfCount;
+        const margin = Math.floor(visibleCount * 0.25);
+        if (currentIdx > viewTopIdx - margin) S.viewCenterIdx += (currentIdx - (viewTopIdx - margin));
+        else if (currentIdx < viewBottomIdx + margin) S.viewCenterIdx -= ((viewBottomIdx + margin) - currentIdx);
+
+        const topIdx = S.viewCenterIdx + halfCount;
+        const botIdx = S.viewCenterIdx - halfCount;
+
+        // Макс объём
+        let maxVol = 0.01;
+        for (let idx = botIdx; idx <= topIdx; idx++) {
+            const c = buckets.get(idx);
+            if (c) maxVol = Math.max(maxVol, c.buyVol + c.sellVol);
+        }
+
+        // Позиция цены
+        const priceInStep = S.price / step;
+        const priceOffset = priceInStep - currentIdx;
+        const priceFromCenter = currentIdx - S.viewCenterIdx + priceOffset;
+        const priceRowFrac = halfCount - priceFromCenter;
+
+        let html = '';
+        html += `<div style="position:absolute;top:${priceRowFrac * rowH}px;left:0;right:0;height:1px;background:var(--accent);opacity:0.7;z-index:5;pointer-events:none;"></div>`;
+
+        html += '<table class="w-full" style="border-collapse:collapse;position:relative;z-index:1;">';
+        html += '<colgroup><col style="width:calc(100% - 120px)"><col style="width:45px"><col style="width:75px"></colgroup>';
+
+        for (let idx = topIdx; idx >= botIdx; idx--) {
+            const c = buckets.get(idx) || { buyVol: 0, sellVol: 0 };
+            const total = c.buyVol + c.sellVol;
+            const delta = c.buyVol - c.sellVol;
+            const price = idx * step;
+            const isPoc = pocIdx !== null && idx === pocIdx;
+            const isCurrent = idx === currentIdx;
+
+            const totalW = maxVol > 0 ? (total / maxVol) * 100 : 0;
+            const buyW = total > 0 ? (c.buyVol / total) * totalW : 0;
+            const sellW = total > 0 ? (c.sellVol / total) * totalW : 0;
+            const deltaClass = delta >= 0 ? 'delta-pos' : 'delta-neg';
+            const deltaSign = delta >= 0 ? '+' : '';
+
+            let priceColor = 'var(--text)', priceWeight = '400';
+            if (isPoc) { priceColor = 'var(--poc)'; priceWeight = '700'; }
+            else if (isCurrent) { priceColor = 'var(--accent)'; priceWeight = '700'; }
+
+            html += `<tr class="c-row${isPoc ? ' is-poc' : ''}" style="height:${rowH}px;">`;
+            html += `<td class="px-1"><div style="display:flex;height:14px;border-radius:2px;overflow:hidden;background:rgba(255,255,255,.02);">`;
+            if (total > 0) {
+                html += `<div class="bar-buy" style="width:${buyW.toFixed(2)}%;"></div>`;
+                html += `<div class="bar-sell" style="width:${sellW.toFixed(2)}%;"></div>`;
+            }
+            html += `</div></td>`;
+            html += `<td class="mono text-right text-[10px] ${deltaClass} pr-2" style="white-space:nowrap;">`;
+            if (Math.abs(delta) > 0.0005) html += `${deltaSign}${delta.toFixed(inst.volDec)}`;
+            html += `</td>`;
+            html += `<td class="mono text-right pr-2 text-[11px]" style="color:${priceColor};font-weight:${priceWeight};white-space:nowrap;">`;
+            if (isPoc) html += '<i class="fa-solid fa-caret-left text-[7px] mr-0.5" style="color:var(--poc)"></i>';
+            html += `${price.toFixed(inst.decimals)}`;
+            html += `</td></tr>`;
+        }
+
+        html += '</table>';
+        elCluster.innerHTML = html;
+        elCluster.style.position = 'relative';
+
+        $('hdrPoc').textContent = pocIdx !== null ? (pocIdx * step).toFixed(inst.decimals) : '—';
+        $('clusterInfo').textContent = `Уровней: ${buckets.size} | Шаг: ${step.toFixed(inst.decimals)} | Сделок: ${S.tradeCount}`;
+    }
+
+    function renderDelta() {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.parentElement.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
+        const W = rect.width, H = rect.height;
+        ctx.clearRect(0, 0, W, H);
+        const data = S.cumDelta;
+        if (data.length < 2) return;
+
+        const deltas = data.map(d => d.delta);
+        const minD = Math.min(0, ...deltas);
+        const maxD = Math.max(0, ...deltas);
+        const range = Math.max(1, maxD - minD);
+        const pad = 4;
+        const zeroY = H - pad - ((0 - minD) / range) * (H - pad * 2);
+
+        // Нулевая линия
+        ctx.strokeStyle = 'rgba(90,106,132,.2)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(0, zeroY);
+        ctx.lineTo(W, zeroY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Линия дельты
+        ctx.beginPath();
+        const stepX = W / Math.max(1, data.length - 1);
+        for (let i = 0; i < data.length; i++) {
+            const x = i * stepX;
+            const y = H - pad - ((data[i].delta - minD) / range) * (H - pad * 2);
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = 'var(--accent)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        // Заливка
+        ctx.lineTo((data.length - 1) * stepX, zeroY);
+        ctx.lineTo(0, zeroY);
+        ctx.closePath();
+        const lastDelta = deltas[deltas.length - 1];
+        const grad = ctx.createLinearGradient(0, 0, 0, H);
+        if (lastDelta >= 0) {
+            grad.addColorStop(0, 'rgba(0,232,123,0.15)');
+            grad.addColorStop(1, 'rgba(0,232,123,0.01)');
+        } else {
+            grad.addColorStop(0, 'rgba(255,46,94,0.15)');
+            grad.addColorStop(1, 'rgba(255,46,94,0.01)');
+        }
+        ctx.fillStyle = grad;
+        ctx.fill();
+
+        const cumEl = $('hdrDelta');
+        cumEl.textContent = (lastDelta >= 0 ? '+' : '') + lastDelta.toFixed(2);
+        cumEl.style.color = lastDelta >= 0 ? 'var(--buy)' : 'var(--sell)';
+        $('deltaInfo').textContent = `Сделок: ${data.length}`;
+    }
+
+    function renderHeader() {
+        if (S.price === 0) return;
+        const inst = getInst(S.symbol);
+        const refPrice = S.openPrice || S.priceStart;
+        const chg = refPrice > 0 ? ((S.price - refPrice) / refPrice * 100) : 0;
+        const priceEl = $('hdrPrice');
+        priceEl.textContent = S.price.toLocaleString('en-US', { minimumFractionDigits: inst.decimals, maximumFractionDigits: inst.decimals });
+        priceEl.style.color = chg >= 0 ? 'var(--buy)' : 'var(--sell)';
+        const chgEl = $('hdrChg');
+        chgEl.textContent = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%';
+        chgEl.style.background = chg >= 0 ? 'var(--buy-dim)' : 'var(--sell-dim)';
+        chgEl.style.color = chg >= 0 ? 'var(--buy)' : 'var(--sell)';
+        $('hdrTime').textContent = new Date().toLocaleTimeString('ru-RU');
+    }
+
+    // === ГЛАВНЫЙ ЦИКЛ ===
+    let renderRAF = null, lastRender = 0;
+    function renderLoop(ts) {
+        renderRAF = requestAnimationFrame(renderLoop);
+        if (ts - lastRender < 80) return;
+        lastRender = ts;
+        checkPeriodReset();
+        renderClusters();
+        renderDelta();
+        renderHeader();
+    }
+
+    function start() {
+        S.price = 0; S.priceStart = 0; S.openPrice = 0; S.viewCenterIdx = 0;
+        S.rawBuckets.clear(); S.cumDelta = []; S.totalDelta = 0;
+        S.totalVol = 0; S.tradeCount = 0; S.maxTrade = 0; S.periodStart = Date.now();
+        $('inpSymbol').classList.remove('error');
+        connectWS();
+        if (!renderRAF) renderRAF = requestAnimationFrame(renderLoop);
+    }
+
+    function applySymbol(input) {
+        let raw = input.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+        if (!raw) return;
+        if (raw.endsWith('USDT')) raw = raw.slice(0, -4);
+        if (!raw) return;
+        $('inpSymbol').value = raw;
+        S.symbol = raw + 'USDT';
+        start();
+    }
+
+    let symbolTimeout = null;
+    $('inpSymbol').addEventListener('input', e => {
+        if (symbolTimeout) clearTimeout(symbolTimeout);
+        symbolTimeout = setTimeout(() => applySymbol(e.target.value), 600);
+    });
+    $('inpSymbol').addEventListener('keydown', e => {
+        if (e.key === 'Enter') { if (symbolTimeout) clearTimeout(symbolTimeout); applySymbol(e.target.value); }
+    });
+    $('inpSymbol').addEventListener('paste', e => {
+        e.preventDefault();
+        const text = (e.clipboardData || window.clipboardData).getData('text');
+        applySymbol(text);
+    });
+
+    $('selPeriod').addEventListener('change', e => {
+        S.period = parseInt(e.target.value);
+        S.periodStart = Date.now();
+        S.viewCenterIdx = 0;
+        S.rawBuckets.clear(); S.totalDelta = 0; S.cumDelta = [];
+        S.totalVol = 0; S.tradeCount = 0; S.maxTrade = 0;
+    });
+    $('selCompress').addEventListener('change', e => {
+        S.compression = parseInt(e.target.value);
+        // Сырые данные на уровне тика не меняются, пересчёт только при рендере
+        S.viewCenterIdx = 0; // пересчитается при рендере
+    });
+    $('btnSound').addEventListener('click', () => {
+        S.soundOn = !S.soundOn;
+        $('btnSound').innerHTML = S.soundOn ? '<i class="fa-solid fa-volume-high" style="color:var(--accent)"></i>' : '<i class="fa-solid fa-volume-xmark"></i>';
+        if (S.soundOn && !audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    });
+
+    loadExchangeInfo().then(() => start());
+    </script>
+</body>
+</html>
